@@ -1,16 +1,28 @@
+# utils/link_parser.py
 import os
 import re
 from pathlib import Path
-from typing import List, Dict, Tuple
-
+from typing import List, Dict
 
 URL_REGEX = re.compile(
     r"(https?://[^\s]+)",
     re.IGNORECASE
 )
 
-VIDEO_EXT = {".mp4", ".mkv", ".mov", ".avi", ".webm"}
-ARCHIVE_EXT = {".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".tar.gz"}
+VIDEO_EXT = {
+    ".mp4", ".mkv", ".mov", ".avi", ".webm", ".ts"
+}
+ARCHIVE_EXT = {
+    ".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".tar.gz", ".tar.bz2", ".tbz2", ".bz2", ".xz"
+}
+AUDIO_EXT = {
+    ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".flac", ".wav"
+}
+APK_EXT = {
+    ".apk", ".xapk", ".apks"
+}
+
+FILE_EXT = VIDEO_EXT | ARCHIVE_EXT | AUDIO_EXT | APK_EXT
 
 
 def find_links_in_text(text: str) -> List[str]:
@@ -18,17 +30,27 @@ def find_links_in_text(text: str) -> List[str]:
 
 
 def classify_link(url: str) -> str:
-    u = url.lower()
-    if "drive.google.com" in u:
+    """
+    Return: 'gdrive' | 'telegram' | 'm3u8' | 'direct' | 'unknown'
+    """
+    u = url.strip()
+    u_low = u.lower()
+
+    if "drive.google.com" in u_low:
         return "gdrive"
-    if "t.me/" in u or "telegram.me/" in u:
+    if "t.me/" in u_low or "telegram.me/" in u_low:
         return "telegram"
-    if u.endswith(".m3u8"):
+
+    # strip query & fragment for extension check
+    base = u_low.split("?", 1)[0].split("#", 1)[0]
+
+    if base.endswith(".m3u8"):
         return "m3u8"
-    # simple extension check for direct file
-    for ext in VIDEO_EXT | ARCHIVE_EXT:
-        if u.endswith(ext):
+
+    for ext in FILE_EXT:
+        if base.endswith(ext):
             return "direct"
+
     return "unknown"
 
 
