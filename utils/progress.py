@@ -1,4 +1,4 @@
-import math
+# utils/progress.py
 import time
 from typing import Dict
 
@@ -10,12 +10,12 @@ _last_update: Dict[int, float] = {}  # msg_id -> timestamp
 
 
 def human_bytes(size: int) -> str:
-    # simple human readable
     if size == 0:
         return "0 B"
     power = 1024
     n = 0
     power_labels = ["B", "KB", "MB", "GB", "TB"]
+    size = float(size)
     while size >= power and n < len(power_labels) - 1:
         size /= power
         n += 1
@@ -40,8 +40,12 @@ async def progress_for_pyrogram(
     message: Message,
     start_time: float,
     file_name: str,
-    direction: str = "to my server",  # or "to Telegram"
+    direction: str = "to my server",
 ):
+    """
+    Pyrogram progress callback.
+    NOTE: start_time = time.time() hona chahiye. (bot.py me fix kiya gaya hai)
+    """
     now = time.time()
     msg_id = message.id
     last = _last_update.get(msg_id, 0)
@@ -50,14 +54,14 @@ async def progress_for_pyrogram(
 
     _last_update[msg_id] = now
 
-    if total == 0:
-        percent = 0
+    if total <= 0:
+        percent = 0.0
     else:
         percent = current * 100 / total
 
-    elapsed = now - start_time
-    speed = current / elapsed if elapsed > 0 else 0
-    eta = int((total - current) / speed) if speed > 0 else 0
+    elapsed = max(now - start_time, 1e-3)  # 0 se bachne ke liye
+    speed = current / elapsed  # bytes/sec
+    eta = int((total - current) / speed) if speed > 0 and total > 0 else 0
 
     filled_len = int(20 * percent / 100)
     bar = "●" * filled_len + "○" * (20 - filled_len)
@@ -76,7 +80,6 @@ async def progress_for_pyrogram(
     try:
         await message.edit_text(text)
     except Exception:
-        # ignore edit errors (e.g., message deleted)
         pass
 
     if current == total and msg_id in _last_update:
