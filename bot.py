@@ -1590,6 +1590,7 @@ async def handle_links_download_all(
     ok = 0
     fail = 0
     chat_id = cq.message.chat.id
+    thread_id = getattr(cq.message, "message_thread_id", None)
 
     # Pin progress message in DM
     is_private = cq.message.chat.type == enums.ChatType.PRIVATE
@@ -1603,6 +1604,9 @@ async def handle_links_download_all(
 
     # direct + unknown as direct
     for url in candidate_direct:
+        if user_cancelled.get(user_id):
+            break
+
         base_raw = url.split("?", 1)[0].split("#", 1)[0]
         base_guess = base_raw.rsplit("/", 1)[-1] or f"file_{uuid.uuid4().hex}"
         dest_path = str(temp_root / base_guess)
@@ -1610,6 +1614,7 @@ async def handle_links_download_all(
             status = await client.send_message(
                 chat_id,
                 f"Downloading from link:\n{url}",
+                message_thread_id=thread_id,
             )
             final_path = await download_file(
                 url,
@@ -1638,6 +1643,7 @@ async def handle_links_download_all(
                     thumb=thumb_arg,
                     progress=progress_for_pyrogram,
                     progress_args=(status, start_u, basename, "to Telegram"),
+                    message_thread_id=thread_id,
                 )
             else:
                 start_u = time.time()
@@ -1647,6 +1653,7 @@ async def handle_links_download_all(
                     caption=basename,
                     progress=progress_for_pyrogram,
                     progress_args=(status, start_u, basename, "to Telegram"),
+                    message_thread_id=thread_id,
                 )
             try:
                 await status.delete()
@@ -1665,6 +1672,9 @@ async def handle_links_download_all(
 
     # Google Drive
     for url in gdrive_links:
+        if user_cancelled.get(user_id):
+            break
+
         direct_url = get_gdrive_direct_link(url)
         if not direct_url:
             fail += 1
@@ -1676,6 +1686,7 @@ async def handle_links_download_all(
             status = await client.send_message(
                 chat_id,
                 f"Downloading from GDrive:\n{url}",
+                message_thread_id=thread_id,
             )
             final_path = await download_file(
                 direct_url,
@@ -1704,6 +1715,7 @@ async def handle_links_download_all(
                     thumb=thumb_arg,
                     progress=progress_for_pyrogram,
                     progress_args=(status, start_u, basename, "to Telegram"),
+                    message_thread_id=thread_id,
                 )
             else:
                 start_u = time.time()
@@ -1713,6 +1725,7 @@ async def handle_links_download_all(
                     caption=basename,
                     progress=progress_for_pyrogram,
                     progress_args=(status, start_u, basename, "to Telegram"),
+                    message_thread_id=thread_id,
                 )
             try:
                 await status.delete()
@@ -1731,6 +1744,8 @@ async def handle_links_download_all(
 
     # m3u8: quality menus
     for url in m3u8_links:
+        if user_cancelled.get(user_id):
+            break
         await offer_m3u8_quality_menu(client, cq, user_id, url, temp_root)
 
     txt = (
@@ -1752,6 +1767,9 @@ async def handle_links_download_all(
         except Exception:
             pass
         await client.send_message(chat_id, "All link downloads finished ✅")
+    
+    
+            
 
 
 async def offer_m3u8_quality_menu(
