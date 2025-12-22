@@ -180,10 +180,23 @@ async def log_user_input(client: Client, message: Message, context: str):
     if not chat_id:
         return
 
-    cap = f"🔹 <b>INPUT</b>: {context}"
+    # Text summary
+    cap = (
+        f"🔹 <b>INPUT</b>\n"
+        f"• User: <b>{user.first_name or ''}</b> (@{user.username or 'N/A'})\n"
+        f"• ID: <code>{user.id}</code>\n"
+        f"• Context: <code>{context}</code>"
+    )
     if message.caption:
         cap += f"\n\n{message.caption}"
 
+    # Always try to send at least a text log
+    try:
+        await client.send_message(chat_id, cap, message_thread_id=thread_id)
+    except Exception:
+        pass
+
+    # Try media copy as well (so you see actual file)
     try:
         await message.copy(
             chat_id=chat_id,
@@ -193,7 +206,6 @@ async def log_user_input(client: Client, message: Message, context: str):
     except Exception:
         pass
 
-
 async def log_user_output(client: Client, user, msg: Message, context: str):
     if not Config.LOG_CHANNEL_ID or not user or not msg:
         return
@@ -201,10 +213,22 @@ async def log_user_output(client: Client, user, msg: Message, context: str):
     if not chat_id:
         return
 
-    cap = f"✅ <b>OUTPUT</b>: {context}"
+    cap = (
+        f"✅ <b>OUTPUT</b>\n"
+        f"• User: <b>{user.first_name or ''}</b> (@{user.username or 'N/A'})\n"
+        f"• ID: <code>{user.id}</code>\n"
+        f"• Context: <code>{context}</code>"
+    )
     if msg.caption:
         cap += f"\n\n{msg.caption}"
 
+    # Text log for sure
+    try:
+        await client.send_message(chat_id, cap, message_thread_id=thread_id)
+    except Exception:
+        pass
+
+    # And media copy if possible
     try:
         await msg.copy(
             chat_id=chat_id,
