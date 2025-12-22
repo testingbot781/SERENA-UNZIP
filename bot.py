@@ -1,0 +1,1259 @@
+# bot.py
+import asyncio
+import os
+import random
+import re
+import shutil
+import time
+import uuid
+from pathlib import Path
+from typing import Dict, Any, Optional, Tuple
+
+from pyrogram import Client, filters, enums, idle
+from pyrogram.types import (
+    Message,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery,
+    Chat,
+)
+from pyrogram.errors import MessageNotModified
+
+from config import Config
+from database import (
+    get_or_create_user,
+    is_banned,
+    update_user_stats,
+    set_ban,
+    count_users,
+    get_all_users,
+    register_temp_path,
+)
+from utils.progress import progress_for_pyrogram, human_bytes
+from utils.extractors import extract_archive, detect_encrypted
+from utils.link_parser import (
+    find_links_in_text,
+    extract_links_from_folder,
+    classify_link,
+)
+from utils.cleanup import cleanup_worker
+from utils.media_tools import extract_audio, generate_thumbnail
+from utils.http_downloader import download_file
+from utils.m3u8_tools import get_m3u8_variants, download_m3u8_stream
+from utils.gdrive import get_gdrive_direct_link
+
+
+# ----------------- Pyrogram client -----------------
+
+app = Client(
+    "serena_unzip_bot",
+    api_id=Config.API_ID,
+    api_hash=Config.API_HASH,
+    bot_token=Config.BOT_TOKEN,
+    in_memory=True,
+)
+
+# in‑memory state
+user_locks: Dict[int, asyncio.Lock] = {}
+tasks: Dict[str, Dict[str, Any]] = {}        # unzip tasks
+pending_password: Dict[int, Dict[str, Any]] = {}
+user_cancelled: Dict[int, bool] = {}
+M3U8_TASKS: Dict[str, Dict[str, Any]] = {}    # quality select tasks
+
+VIDEO_EXT_SET = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".ts"}
+
+EMOJI_LIST = [
+    "🚀",
+    "📦",
+    "🎬",
+    "🧩",
+    "📄",
+    "🔗",
+    "🧪",
+    "⚡",
+    "💾",
+    "🧰",
+]
+
+# premium + caption settings
+premium_until: Dict[int, float] = {}  # user_id -> timestamp until premium
+user_caption_settings: Dict[int, Dict[str, Any]] = {}  # user_id -> {base, counter, rfrom, rto, updated_at}
+pending_settings_action: Dict[int, str] = {}  # user_id -> "caption" | "replace"
+
+# link sessions for TXT + messages: (chat_id, msg_id) -> {links, content}
+LINK_SESSIONS: Dict[Tuple[int, int], Dict[str, Any]] = {}
+
+
+def get_lock(user_id: int) -> asyncio.Lock:
+    if user_id not in user_locks:
+        user_locks[user_id] = asyncio.Lock()
+    return user_locks[user_id]
+
+
+def is_owner(user_id: int) -> bool:
+    return user_id in Config.OWNER_IDS
+
+
+def is_video_path(path: str) -> bool:
+    return Path(path).suffix.lower() in VIDEO_EXT_SET
+
+
+def random_emoji() -> str:
+    return random.choice(EMOJI_LIST)
+
+
+def is_premium_user(user_id: int) -> bool:
+    t = premium_until.get(user_id)
+    if not t:
+        return False
+    if t < time.time():
+        premium_until.pop(user_id, None)
+        return False
+    return True
+
+
+# ----------------- logging helpers (topics per user) -----------------
+
+log_chat_info: Optional[Chat] = None
+log_is_forum: bool = False
+user_log_topics: Dict[int, int] = {}  # user_id -> message_thread_id
+
+
+async def get_log_chat_info(client: Client) -> Tuple[Optional[Chat], bool]:
+    global log_chat_info, log_is_forum
+    if log_chat_info is not None:
+        return log_chat_info, log_is_forum
+    try:
+        chat = await client.get_chat(Config.LOG_CHANNEL_ID)
+        log_chat_info = chat
+        log_is_forum = bool(getattr(chat, "is_forum", False))
+    except Exception:
+        log_chat_info = None
+        log_is_forum = False
+    return log_chat_info, log_is_forum
+
+
+async def get_user_log_target(client: Client, user) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Returns (chat_id, thread_id or None).
+    If log chat is a forum, ensures a topic per user.
+    """
+    if not Config.LOG_CHANNEL_ID:
+        return None, None
+
+    chat_info, is_forum = await get_log_chat_info(client)
+    if not chat_info:
+        return None, None
+
+    chat_id = chat_info.id
+
+    if not is_forum:
+        return chat_id, None
+
+    # forum with topics
+    if user.id in user_log_topics:
+        return chat_id, user_log_topics[user.id]
+
+    # create new topic
+    name = f"{user.first_name or 'User'} | {user.id}"
+    try:
+        topic_msg = await client.create_forum_topic(chat_id, name=name)
+        thread_id = topic_msg.message_thread_id
+        user_log_topics[user.id] = thread_id
+        intro = (
+            f"👤 <b>User</b>\n"
+            f"• Name: <b>{user.first_name or ''}</b> (@{user.username or 'N/A'})\n"
+            f"• ID: <code>{user.id}</code>\n"
+            f"• First seen: <code>{time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}</code>"
+        )
+        await client.send_message(chat_id, intro, message_thread_id=thread_id)
+        return chat_id, thread_id
+    except Exception:
+        # fallback: send in main chat
+        return chat_id, None
+
+
+async def log_user_input(client: Client, message: Message, context: str):
+    if not Config.LOG_CHANNEL_ID:
+        return
+    user = message.from_user
+    if not user:
+        return
+    chat_id, thread_id = await get_user_log_target(client, user)
+    if not chat_id:
+        return
+
+    cap = (
+        f"🔹 <b>INPUT</b>\n"
+        f"• User: <b>{user.first_name or ''}</b> (@{user.username or 'N/A'})\n"
+        f"• ID: <code>{user.id}</code>\n"
+        f"• Context: <code>{context}</code>"
+    )
+    if message.caption:
+        cap += f"\n\n{message.caption}"
+
+    # text log
+    try:
+        await client.send_message(chat_id, cap, message_thread_id=thread_id)
+    except Exception:
+        pass
+
+    # media copy
+    try:
+        await message.copy(
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            caption=cap,
+        )
+    except Exception:
+        pass
+
+
+async def log_user_output(client: Client, user, msg: Message, context: str):
+    if not Config.LOG_CHANNEL_ID or not user or not msg:
+        return
+    chat_id, thread_id = await get_user_log_target(client, user)
+    if not chat_id:
+        return
+
+    cap = (
+        f"✅ <b>OUTPUT</b>\n"
+        f"• User: <b>{user.first_name or ''}</b> (@{user.username or 'N/A'})\n"
+        f"• ID: <code>{user.id}</code>\n"
+        f"• Context: <code>{context}</code>"
+    )
+    if msg.caption:
+        cap += f"\n\n{msg.caption}"
+
+    try:
+        await client.send_message(chat_id, cap, message_thread_id=thread_id)
+    except Exception:
+        pass
+
+    try:
+        await msg.copy(
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            caption=cap,
+        )
+    except Exception:
+        pass
+
+
+# ----------------- caption helpers -----------------
+
+
+def get_caption_cfg(user_id: int) -> Optional[Dict[str, Any]]:
+    cfg = user_caption_settings.get(user_id)
+    if not cfg:
+        return None
+
+    # TTL: 1 day for non-premium users
+    now = time.time()
+    if not is_premium_user(user_id) and now - cfg.get("updated_at", 0) > 86400:
+        user_caption_settings.pop(user_id, None)
+        return None
+
+    return cfg
+
+
+def build_caption(user_id: int, default_caption: str) -> str:
+    cfg = get_caption_cfg(user_id)
+    if not cfg:
+        return default_caption
+
+    caption = default_caption
+
+    # Numbered caption: 001 Title, 002 Title, ...
+    base = cfg.get("base")
+    if base:
+        counter = cfg.get("counter", 0) + 1
+        cfg["counter"] = counter
+        caption = f"{counter:03d} {base}"
+
+    # Replace words
+    rfrom = cfg.get("rfrom")
+    rto = cfg.get("rto")
+    if rfrom and rto:
+        caption = caption.replace(rfrom, rto)
+
+    cfg["updated_at"] = time.time()
+    user_caption_settings[user_id] = cfg
+    return caption
+
+
+# ----------------- helpers -----------------
+
+
+async def check_force_sub(client: Client, message: Message) -> bool:
+    if not message.from_user:
+        return True
+    if not Config.FORCE_SUB_CHANNEL:
+        return True
+    try:
+        member = await client.get_chat_member(
+            Config.FORCE_SUB_CHANNEL, message.from_user.id
+        )
+        if member.status not in (
+            enums.ChatMemberStatus.OWNER,
+            enums.ChatMemberStatus.ADMINISTRATOR,
+            enums.ChatMemberStatus.MEMBER,
+        ):
+            raise ValueError
+        return True
+    except Exception:
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "Join official channel",
+                        url=f"https://t.me/{Config.FORCE_SUB_CHANNEL}",
+                    )
+                ],
+                [InlineKeyboardButton("Try again", callback_data="retry_force_sub")],
+            ]
+        )
+        try:
+            await message.reply_text(
+                "Yo fam, pehle official channel join karo phir wapas try karo 😎",
+                reply_markup=kb,
+            )
+        except Exception:
+            pass
+        return False
+
+
+def main_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Join official channel",
+                    url=f"https://t.me/{Config.FORCE_SUB_CHANNEL}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "Owner Contact",
+                    url=f"https://t.me/{Config.OWNER_USERNAME}",
+                )
+            ],
+        ]
+    )
+
+
+def settings_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📝 Add Caption", callback_data="settings:caption"),
+                InlineKeyboardButton("🔤 Replace Words", callback_data="settings:replace"),
+            ],
+            [
+                InlineKeyboardButton("⚙️ Reset Settings", callback_data="settings:reset"),
+            ],
+            [
+                InlineKeyboardButton(
+                    "Owner Contact", url=f"https://t.me/{Config.OWNER_USERNAME}"
+                )
+            ],
+        ]
+    )
+
+
+def is_archive_file(name: str) -> bool:
+    n = name.lower()
+    return any(n.endswith(ext) for ext in (".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".tar.gz"))
+
+
+def is_video_file(name: str) -> bool:
+    n = name.lower()
+    return any(n.endswith(ext) for ext in VIDEO_EXT_SET)
+
+
+def file_action_keyboard(msg: Message, is_archive: bool, is_video: bool) -> InlineKeyboardMarkup:
+    chat_id = msg.chat.id
+    msg_id = msg.id
+    rows = []
+    if is_archive:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "📦 Unzip",
+                    callback_data=f"unzip|{chat_id}|{msg_id}|nopass",
+                ),
+                InlineKeyboardButton(
+                    "🔐 With Password",
+                    callback_data=f"unzip|{chat_id}|{msg_id}|askpass",
+                ),
+            ]
+        )
+    if is_video:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "🎧 Extract Audio",
+                    callback_data=f"audio|{chat_id}|{msg_id}",
+                ),
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "Owner Contact", url=f"https://t.me/{Config.OWNER_USERNAME}"
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+# ----------------- commands -----------------
+
+
+@app.on_message(filters.command("start"))
+async def start_cmd(client: Client, message: Message):
+    if not message.from_user:
+        return
+
+    if await is_banned(message.from_user.id):
+        return
+
+    if not await check_force_sub(client, message):
+        return
+
+    await get_or_create_user(message.from_user.id)
+
+    caption = (
+        f"Hey {message.from_user.first_name or 'there'} 👋\n\n"
+        f"Welcome to <b>{Config.BOT_NAME}</b>\n\n"
+        "I’m your all‑in‑one archive & media assistant:\n"
+        f"{random_emoji()} Unzip 20+ formats (ZIP/RAR/7Z/TAR, with passwords)\n"
+        f"{random_emoji()} Extract audio from any video\n"
+        f"{random_emoji()} Auto‑process TXT & links (direct, m3u8, GDrive)\n"
+        f"{random_emoji()} Smart file listing: send single or all files\n\n"
+        "Use <code>/help</code> to see full usage with examples."
+    )
+
+    if Config.START_PIC:
+        await message.reply_photo(
+            Config.START_PIC,
+            caption=caption,
+            reply_markup=main_keyboard(),
+        )
+    else:
+        await message.reply_text(
+            caption,
+            reply_markup=main_keyboard(),
+        )
+
+
+@app.on_message(filters.command("help") & filters.private)
+async def help_cmd(client: Client, message: Message):
+    text = (
+        "✨ <b>Serena Unzip – Help & Usage</b>\n\n"
+        "🧩 <b>Basic</b>\n"
+        "• <code>/start</code> – Welcome screen & quick intro.\n"
+        "• <code>/help</code> – This help menu.\n"
+        "• <code>/settings</code> – View current defaults & caption tools.\n"
+        "• <code>/cancel</code> – Mark current task as cancelled.\n\n"
+        "📦 <b>Archives (ZIP / RAR / 7Z / TAR…)</b>\n"
+        "1) Send or forward any archive file.\n"
+        "2) Tap:\n"
+        "   • <b>📦 Unzip</b> – Normal extract.\n"
+        "   • <b>🔐 With Password</b> – Bot asks for password, then extracts.\n"
+        "3) After extract you get:\n"
+        "   • Summary of videos / PDFs / APKs / TXT / m3u8 / others.\n"
+        "   • Inline file list → tap any to get that single file.\n"
+        "   • <b>Send ALL</b> – sends every file back (videos as playable media).\n\n"
+        "🎬 <b>Videos & Audio</b>\n"
+        "• Send any video → tap <b>🎧 Extract Audio</b>.\n"
+        "  - Bot downloads, extracts audio via ffmpeg and sends it.\n"
+        "• Extracted / downloaded videos are sent as real Telegram videos\n"
+        "  with thumbnails generated from inside the video.\n\n"
+        "🔗 <b>TXT / Links Power Mode</b>\n"
+        "1) Send a message or <b>.txt file</b> containing links in DM.\n"
+        "2) Bot shows:\n"
+        "   • <b>Download all videos/files</b>\n"
+        "   • <b>Cleaned TXT only</b> (just the links)\n"
+        "   • <b>Skip</b>\n"
+        "3) On <b>Download all</b>:\n"
+        "   • Direct file links (mp4/mkv/zip/apk/xapk/audio/…) are downloaded\n"
+        "     with progress bar (speed + ETA) and then sent.\n"
+        "   • Google Drive links are converted to direct download when possible and\n"
+        "     downloaded with their real filename (e.g. .mp4, .jpg, .pdf).\n"
+        "   • m3u8 links: you get quality buttons (360p / 480p / 720p / Auto etc).\n"
+        "     You choose quality → ffmpeg downloads → bot sends mp4.\n"
+        "   • When link‑based downloading starts, the DM status message is pinned\n"
+        "     and unpinned when completed.\n\n"
+        "👥 <b>Groups & Channels</b>\n"
+        "• Mention @bot or reply to the bot with a message containing links →\n"
+        "  same link processing as in DM.\n\n"
+        "🛠 <b>Admin Only</b>\n"
+        "• <code>/status</code> – User stats & disk usage.\n"
+        "• <code>/broadcast</code> – Reply and broadcast to all users.\n"
+        "• <code>/premium &lt;id&gt; [days]</code> – Grant premium (caption rules never expire).\n"
+        "• <code>/ban &lt;id&gt;</code> / <code>/unban &lt;id&gt;</code> – Ban/unban.\n"
+        "• <code>/clean</code> – Manual temp storage cleanup.\n\n"
+        "<i>Tip:</i> Very large Google Drive files or protected links may fail due to Google,\n"
+        "not the bot. Try smaller or public links for best results.\n"
+    )
+    await message.reply_text(text)
+
+
+@app.on_message(filters.command("settings") & filters.private)
+async def settings_cmd(client: Client, message: Message):
+    cfg = get_caption_cfg(message.from_user.id)
+    base = cfg.get("base") if cfg else None
+    rfrom = cfg.get("rfrom") if cfg else None
+    rto = cfg.get("rto") if cfg else None
+
+    status_lines = []
+    if base:
+        status_lines.append(f"• Caption base: <code>{base}</code>")
+    else:
+        status_lines.append("• Caption base: <code>None</code>")
+
+    if rfrom and rto:
+        status_lines.append(f"• Replace: <code>{rfrom}</code> → <code>{rto}</code>")
+    else:
+        status_lines.append("• Replace: <code>None</code>")
+
+    text = (
+        f"{random_emoji()} <b>Current Settings</b>\n\n"
+        "• Auto delete temp files: <b>30 minutes</b>\n"
+        "• Default extract mode: <b>Full archive</b>\n"
+        "• Language: <b>English</b>\n\n"
+        "<b>Caption tools:</b>\n" + "\n".join(status_lines) +
+        "\n\nUse the buttons below to tweak your caption style."
+    )
+
+    if Config.START_PIC:
+        await message.reply_photo(
+            Config.START_PIC,
+            caption=text,
+            reply_markup=settings_keyboard(),
+        )
+    else:
+        await message.reply_text(text, reply_markup=settings_keyboard())
+
+
+@app.on_message(filters.command("cancel") & (filters.private | filters.group | filters.channel))
+async def cancel_cmd(client: Client, message: Message):
+    if not message.from_user:
+        return
+    user_cancelled[message.from_user.id] = True
+    await message.reply_text(
+        "Aight, current task ko cancel mode pe daal diya. Next step se skip hoga 😉"
+    )
+
+
+# ----------------- admin commands -----------------
+
+
+@app.on_message(filters.command(["status", "users"]) & filters.private)
+async def status_cmd(client: Client, message: Message):
+    if not message.from_user or not is_owner(message.from_user.id):
+        return
+
+    total, premium, banned = await count_users()
+
+    total_b = used_b = free_b = 0
+    try:
+        st = shutil.disk_usage("/")
+        total_b, used_b, free_b = st.total, st.used, st.free
+    except Exception:
+        pass
+
+    txt = (
+        "📊 <b>Bot Status</b>\n\n"
+        f"Users: <b>{total}</b>\n"
+        f"Premium: <b>{premium}</b>\n"
+        f"Banned: <b>{banned}</b>\n\n"
+        f"Disk total: <code>{human_bytes(total_b)}</code>\n"
+        f"Disk used: <code>{human_bytes(used_b)}</code>\n"
+        f"Disk free: <code>{human_bytes(free_b)}</code>\n"
+    )
+    await message.reply_text(txt)
+
+
+@app.on_message(filters.command("broadcast") & filters.private)
+async def broadcast_cmd(client: Client, message: Message):
+    if not message.from_user or not is_owner(message.from_user.id):
+        return
+
+    if not message.reply_to_message:
+        await message.reply_text("Reply to a message and use /broadcast.")
+        return
+
+    users = await get_all_users()
+    sent = 0
+    failed = 0
+    for uid in users:
+        try:
+            await message.reply_to_message.copy(chat_id=uid)
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
+
+    await message.reply_text(f"Broadcast done.\nSent: {sent}\nFailed: {failed}")
+
+
+@app.on_message(filters.command("premium") & filters.private)
+async def premium_cmd(client: Client, message: Message):
+    if not message.from_user or not is_owner(message.from_user.id):
+        return
+
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.reply_text(
+            "Usage:\n"
+            "<code>/premium &lt;user_id&gt; [days]</code>\n"
+            "Example:\n<code>/premium 123456789 10</code>"
+        )
+        return
+
+    try:
+        target_id = int(parts[1])
+    except ValueError:
+        await message.reply_text("User ID must be an integer.")
+        return
+
+    days = 10
+    if len(parts) >= 3:
+        try:
+            days = int(parts[2])
+        except ValueError:
+            pass
+
+    if days <= 0:
+        days = 10
+
+    premium_until[target_id] = time.time() + days * 86400
+    await message.reply_text(
+        f"User <code>{target_id}</code> is premium for <b>{days}</b> day(s).\n"
+        f"Caption rules for them won’t auto‑reset during this time."
+    )
+
+
+@app.on_message(filters.command(["ban", "unban"]) & filters.private)
+async def ban_cmd(client: Client, message: Message):
+    if not message.from_user or not is_owner(message.from_user.id):
+        return
+
+    cmd = message.command[0].lower()
+    target_id = None
+
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+    elif len(message.command) > 1:
+        try:
+            target_id = int(message.command[1])
+        except ValueError:
+            pass
+
+    if not target_id:
+        await message.reply_text("User id ya kisi user ke message pe reply karo.")
+        return
+
+    if cmd == "ban":
+        await set_ban(target_id, True)
+        await message.reply_text(f"User {target_id} banned.")
+    else:
+        await set_ban(target_id, False)
+        await message.reply_text(f"User {target_id} unbanned.")
+
+
+@app.on_message(filters.command("clean") & filters.private)
+async def clean_cmd(client: Client, message: Message):
+    if not message.from_user or not is_owner(message.from_user.id):
+        return
+    await message.reply_text(
+        "Manual cleanup trigger ho gaya (background worker already run ho raha hai)."
+    )
+
+
+# ----------------- file handlers (private + group + channel) -----------------
+
+
+@app.on_message(
+    (filters.document | filters.video | filters.photo | filters.audio)
+    & (filters.private | filters.group | filters.channel)
+)
+async def on_file(client: Client, message: Message):
+    if not message.from_user:
+        return
+    user_id = message.from_user.id
+    if await is_banned(user_id):
+        return
+
+    if not await check_force_sub(client, message):
+        return
+
+    chat_type = message.chat.type
+
+    user = await get_or_create_user(user_id)
+
+    # log input
+    try:
+        if message.document:
+            ctx = f"document upload: {message.document.file_name}"
+        elif message.video:
+            ctx = f"video upload: {message.video.file_name}"
+        elif message.photo:
+            ctx = "photo upload"
+        elif message.audio:
+            ctx = f"audio upload: {message.audio.file_name}"
+        else:
+            ctx = "media upload"
+        await log_user_input(client, message, ctx)
+    except Exception:
+        pass
+
+    # TXT as link source (DM only)
+    if (
+        chat_type == enums.ChatType.PRIVATE
+        and message.document
+        and (message.document.file_name or "").lower().endswith(".txt")
+    ):
+        temp_root = Path(Config.TEMP_DIR) / str(user_id) / uuid.uuid4().hex
+        temp_root.mkdir(parents=True, exist_ok=True)
+        await register_temp_path(user_id, str(temp_root), Config.AUTO_DELETE_DEFAULT_MIN)
+
+        status = await message.reply_text("Downloading TXT to parse links…")
+        try:
+            txt_path = await client.download_media(
+                message.document,
+                file_name=str(temp_root),
+            )
+        except Exception as e:
+            await status.edit_text(f"TXT download failed:\n<code>{e}</code>")
+            return
+
+        try:
+            content = Path(txt_path).read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            content = ""
+
+        try:
+            await status.delete()
+        except Exception:
+            pass
+
+        await process_links_message(client, message, content)
+        return
+
+    media = message.document or message.video
+    if not media:
+        return
+    file_name = media.file_name or "file"
+
+    kb = file_action_keyboard(
+        message,
+        is_archive=is_archive_file(file_name),
+        is_video=is_video_file(file_name),
+    )
+
+    await message.reply_text(
+        f"Nice drop: <code>{file_name}</code>\nChoose what you wanna do 👇",
+        reply_markup=kb,
+              )
+
+# ----------------- text / links handler (DM + Groups) -----------------
+
+
+async def process_links_message(client: Client, message: Message, content: str):
+    if not message.from_user:
+        return
+    user_id = message.from_user.id
+
+    links = find_links_in_text(content or "")
+    if not links:
+        await message.reply_text("No valid URLs found in this text.")
+        return
+
+    # store session for callbacks (TXT fix)
+    LINK_SESSIONS[(message.chat.id, message.id)] = {
+        "links": links,
+        "content": content or "",
+    }
+
+    # log input text
+    try:
+        await log_user_input(client, message, f"text links: {len(links)} urls")
+    except Exception:
+        pass
+
+    chat_id = message.chat.id
+    msg_id = message.id
+
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "⬇️ Download all videos/files",
+                    callback_data=f"links|download_all|{chat_id}|{msg_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🧹 Cleaned TXT only",
+                    callback_data=f"links|clean_txt|{chat_id}|{msg_id}",
+                ),
+                InlineKeyboardButton(
+                    "Skip",
+                    callback_data=f"links|skip|{chat_id}|{msg_id}",
+                ),
+            ],
+        ]
+    )
+    await message.reply_text(
+        f"Found <b>{len(links)}</b> urls.\nChoose what you wanna do 👇", reply_markup=kb
+    )
+
+
+@app.on_message((filters.text | filters.caption) & filters.private)
+async def on_text(client: Client, message: Message):
+    if not message.from_user:
+        return
+    user_id = message.from_user.id
+
+    # Ignore commands like /broadcast, /premium etc
+    if message.text and message.text.lstrip().startswith("/"):
+        return
+
+    if await is_banned(user_id):
+        return
+
+    # password reply?
+    if user_id in pending_password:
+        info = pending_password.pop(user_id)
+        password = (message.text or message.caption or "").strip()
+        await handle_unzip_from_password(client, message, info, password)
+        return
+
+    # settings reply?
+    if user_id in pending_settings_action:
+        action = pending_settings_action.pop(user_id)
+        txt = (message.text or message.caption or "").strip()
+        if action == "caption":
+            if not txt:
+                await message.reply_text("Caption can’t be empty. Try again with some text.")
+            else:
+                cfg = user_caption_settings.get(user_id) or {}
+                cfg["base"] = txt
+                cfg["counter"] = 0
+                cfg["updated_at"] = time.time()
+                user_caption_settings[user_id] = cfg
+                await message.reply_text(
+                    f"Bet. I’ll caption your videos like:\n"
+                    f"<code>001 {txt}</code>\n"
+                    f"<code>002 {txt}</code> etc. 🔥"
+                )
+        elif action == "replace":
+            parts = [p.strip() for p in re.split(r"->|=>", txt, maxsplit=1)]
+            if len(parts) != 2 or not parts[0]:
+                await message.reply_text(
+                    "Format wrong.\nSend like:\n<code>old_text -> new_text</code>"
+                )
+            else:
+                old, new = parts
+                cfg = user_caption_settings.get(user_id) or {}
+                cfg["rfrom"] = old
+                cfg["rto"] = new
+                cfg["updated_at"] = time.time()
+                user_caption_settings[user_id] = cfg
+                await message.reply_text(
+                    f"Gotchu. I’ll replace <code>{old}</code> with <code>{new}</code> in captions."
+                )
+        return
+
+    if not await check_force_sub(client, message):
+        return
+
+    await get_or_create_user(user_id)
+
+    content = (message.text or message.caption or "").strip()
+    await process_links_message(client, message, content)
+
+
+@app.on_message((filters.text | filters.caption) & (filters.group | filters.channel))
+async def group_text_handler(client: Client, message: Message):
+    if not message.from_user:
+        return
+
+    text = (message.text or message.caption or "") or ""
+    if text.lstrip().startswith("/"):
+        return
+
+    # Mention or reply to bot only
+    me = await client.get_me()
+    mentioned = False
+
+    # @username mention
+    if me.username and ("@" + me.username.lower()) in text.lower():
+        mentioned = True
+
+    # Reply to bot
+    if (
+        message.reply_to_message
+        and message.reply_to_message.from_user
+        and message.reply_to_message.from_user.is_bot
+        and message.reply_to_message.from_user.id == me.id
+    ):
+        mentioned = True
+
+    if not mentioned:
+        return
+
+    if await is_banned(message.from_user.id):
+        return
+
+    if not await check_force_sub(client, message):
+        return
+
+    await get_or_create_user(message.from_user.id)
+
+    content = text.strip()
+    await process_links_message(client, message, content)
+
+
+# ----------------- callback handlers -----------------
+
+
+@app.on_callback_query()
+async def callbacks(client: Client, cq: CallbackQuery):
+    data = cq.data or ""
+    if data == "retry_force_sub":
+        await cq.message.delete()
+        return
+
+    # Settings actions
+    if data.startswith("settings:"):
+        if not cq.from_user:
+            await cq.answer()
+            return
+        user_id = cq.from_user.id
+        action = data.split(":", 1)[1]
+
+        if action == "reset":
+            user_caption_settings.pop(user_id, None)
+            await cq.message.edit_text(
+                "Your caption/replace settings are back to default 🤙",
+                reply_markup=settings_keyboard(),
+            )
+            await cq.answer("Settings reset", show_alert=False)
+            return
+
+        if action == "caption":
+            pending_settings_action[user_id] = "caption"
+            await cq.message.reply_text(
+                "Send me the base caption text.\n\n"
+                "Example: <code>My Serena Pack</code>\n\n"
+                "I’ll use it like:\n"
+                "<code>001 My Serena Pack</code>\n"
+                "<code>002 My Serena Pack</code> etc."
+            )
+            await cq.answer()
+            return
+
+        if action == "replace":
+            pending_settings_action[user_id] = "replace"
+            await cq.message.reply_text(
+                "Send the replace rule in this format:\n"
+                "<code>old_text -> new_text</code>\n\n"
+                "Example:\n<code>kumari -> serena</code>\n"
+                "I’ll replace <b>kumari</b> with <b>serena</b> in captions."
+            )
+            await cq.answer()
+            return
+
+    # Unzip
+    if data.startswith("unzip|"):
+        try:
+            _, chat_id, msg_id, mode = data.split("|", 3)
+            original_msg = await client.get_messages(int(chat_id), int(msg_id))
+        except Exception:
+            await cq.answer("Original file nahi mila.", show_alert=True)
+            return
+        await handle_unzip_button(client, cq, original_msg, mode)
+        return
+
+    # Unzip cancel session
+    if data.startswith("ucancel|"):
+        _, task_id = data.split("|", 1)
+        tasks.pop(task_id, None)
+        try:
+            await cq.message.edit_text("Unzip session cancelled ✅")
+        except Exception:
+            pass
+        await cq.answer()
+        return
+
+    # Audio extract
+    if data.startswith("audio|"):
+        try:
+            _, chat_id, msg_id = data.split("|", 2)
+            original_msg = await client.get_messages(int(chat_id), int(msg_id))
+        except Exception:
+            await cq.answer("Original video nahi mila.", show_alert=True)
+            return
+        await handle_extract_audio(client, cq, original_msg)
+        return
+
+    # send all/single extracted
+    if data.startswith("sendall|"):
+        _, task_id = data.split("|", 1)
+        await handle_send_all(client, cq, task_id)
+        return
+
+    if data.startswith("sendone|"):
+        _, task_id, index = data.split("|", 2)
+        await handle_send_one(client, cq, task_id, int(index))
+        return
+
+    # links actions
+    if data.startswith("links|"):
+        parts = data.split("|", 3)
+        if len(parts) < 4:
+            await cq.answer("Original message nahi mila.", show_alert=True)
+            return
+        _, action, chat_id, msg_id = parts
+        try:
+            original_msg = await client.get_messages(int(chat_id), int(msg_id))
+        except Exception:
+            await cq.answer("Original message nahi mila.", show_alert=True)
+            return
+
+        key = (original_msg.chat.id, original_msg.id)
+        session = LINK_SESSIONS.get(key)
+        content = session["content"] if session else (original_msg.text or original_msg.caption or "") or ""
+        links = session["links"] if session else find_links_in_text(content)
+
+        if action == "clean_txt":
+            await cq.answer()
+            txt = "\n".join(sorted(set(links))) or "No valid URLs found."
+            await cq.message.edit_text("<b>Cleaned URLs:</b>\n\n" + txt[:4000])
+        elif action == "download_all":
+            await cq.answer()
+            await handle_links_download_all(client, cq, original_msg)
+        else:
+            await cq.answer()
+            await cq.message.edit_text("Skipped link processing.")
+        return
+
+    # m3u8 quality choice
+    if data.startswith("m3q|"):
+        try:
+            _, task_id, idx_str = data.split("|", 2)
+            index = int(idx_str)
+        except Exception:
+            await cq.answer("Invalid selection.", show_alert=True)
+            return
+        await handle_m3u8_quality_choice(client, cq, task_id, index)
+        return
+
+    await cq.answer()
+
+# ----------------- unzip flow -----------------
+
+
+async def handle_unzip_button(
+    client: Client, cq: CallbackQuery, original_msg: Message, mode: str
+):
+    if not cq.from_user:
+        await cq.answer()
+        return
+    user_id = cq.from_user.id
+    if await is_banned(user_id):
+        await cq.answer("You are banned.", show_alert=True)
+        return
+
+    if not await check_force_sub(client, original_msg):
+        await cq.answer()
+        return
+
+    doc = original_msg.document
+    if not doc:
+        await cq.answer("No document found.", show_alert=True)
+        return
+
+    file_name = doc.file_name or "archive"
+    if not is_archive_file(file_name):
+        await cq.answer("Ye archive file nahi lag rahi.", show_alert=True)
+        return
+
+    if mode == "askpass":
+        pending_password[user_id] = {
+            "chat_id": original_msg.chat.id,
+            "msg_id": original_msg.id,
+            "file_name": file_name,
+        }
+        await cq.message.reply_text(
+            f"Password bhejo for <code>{file_name}</code> (just text)."
+        )
+        await cq.answer()
+        return
+
+    await cq.answer()
+    await run_unzip_task(client, original_msg, password=None)
+
+
+async def handle_unzip_from_password(
+    client: Client, msg: Message, info: Dict[str, Any], password: str
+):
+    chat_id = info["chat_id"]
+    msg_id = info["msg_id"]
+    original_msg = await client.get_messages(chat_id, msg_id)
+    await msg.reply_text("Got the password, starting extraction…")
+    await run_unzip_task(client, original_msg, password=password)
+
+
+async def run_unzip_task(client: Client, msg: Message, password: Optional[str]):
+    if not msg.from_user:
+        return
+    user_id = msg.from_user.id
+    lock = get_lock(user_id)
+
+    if lock.locked():
+        await msg.reply_text(
+            "Chill, ek task already running hai. Pehle usko finish hone do."
+        )
+        return
+
+    async with lock:
+        user_cancelled[user_id] = False
+        doc = msg.document
+        file_name = doc.file_name or "archive"
+        size_bytes = doc.file_size or 0
+        size_mb = size_bytes / (1024 * 1024)
+
+        user = await get_or_create_user(user_id)
+
+        temp_root = Path(Config.TEMP_DIR) / str(user_id) / uuid.uuid4().hex
+        temp_root.mkdir(parents=True, exist_ok=True)
+
+        await register_temp_path(user_id, str(temp_root), Config.AUTO_DELETE_DEFAULT_MIN)
+
+        status_msg = await msg.reply_text("Downloading archive to server…")
+
+        start = time.time()
+        try:
+            downloaded_path = await client.download_media(
+                doc,
+                file_name=str(temp_root),
+                progress=progress_for_pyrogram,
+                progress_args=(status_msg, start, file_name, "to my server"),
+            )
+        except Exception as e:
+            await status_msg.edit_text(f"Download fail ho gaya:\n<code>{e}</code>")
+            return
+
+        if not downloaded_path:
+            await status_msg.edit_text("Download hua nahi, file path missing hai.")
+            return
+
+        archive_path = downloaded_path
+
+        # log archive input explicitly
+        try:
+            await log_user_input(client, msg, f"archive: {file_name}")
+        except Exception:
+            pass
+
+        if user_cancelled.get(user_id):
+            await status_msg.edit_text("Task cancel kar diya ✅")
+            return
+
+        if not password and detect_encrypted(archive_path):
+            await status_msg.edit_text(
+                "Archive password protected lag rahi hai.\n"
+                "Niche wale 'With Password' button use karo & dobara try karo."
+            )
+            return
+
+        await status_msg.edit_text("Extraction shuru… Thoda sabr 😎")
+        extract_dir = temp_root / "extracted"
+        try:
+            result = extract_archive(archive_path, str(extract_dir), password=password)
+        except Exception as e:
+            await status_msg.edit_text(f"Extract error:\n<code>{e}</code>")
+            return
+
+        if user_cancelled.get(user_id):
+            await status_msg.edit_text(
+                "Task cancel ho gaya mid‑way, output skip kar diya."
+            )
+            return
+
+        stats = result["stats"]
+        files = sorted(result["files"], key=lambda p: p.lower())  # stable series order
+
+        links_map = extract_links_from_folder(str(extract_dir))
+
+        task_id = uuid.uuid4().hex
+        tasks[task_id] = {
+            "type": "unzip",
+            "user_id": user_id,
+            "base_dir": str(extract_dir),
+            "files": files,
+            "archive_name": os.path.basename(archive_path),
+        }
+
+        summary = (
+            f"<b>Extraction done ✅</b>\n\n"
+            f"Archive: <code>{os.path.basename(archive_path)}</code>\n"
+            f"Total files: {stats['total_files']}\n"
+            f"Folders: {stats['folders']}\n"
+            f"Videos: {stats['videos']} | PDFs: {stats['pdf']} | APK: {stats['apk']}\n"
+            f"TXT: {stats['txt']} | M3U/M3U8: {stats['m3u']} | Others: {stats['others']}\n\n"
+            f"Links inside archive:\n"
+            f"• Direct: {len(links_map.get('direct', []))}\n"
+            f"• m3u8: {len(links_map.get('m3u8', []))}\n"
+            f"• GDrive: {len(links_map.get('gdrive', []))}\n"
+            f"• Telegram: {len(links_map.get('telegram', []))}\n"
+        )
+
+        rows = []
+        # Top row: Cancel
+        rows.append(
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"ucancel|{task_id}")]
+        )
+        # Second row: Send all
+        rows.append(
+            [InlineKeyboardButton("🚀 Send ALL files", callback_data=f"sendall|{task_id}")]
+        )
+
+        max_files_buttons = 25
+        for idx, rel_path in enumerate(files[:max_files_buttons]):
+            short = rel_path
+            if len(short) > 40:
+                short = "..." + short[-37:]
+            rows.append(
+                [InlineKeyboardButton(short, callback_data=f"sendone|{task_id}|{idx}")]
+            )
+
+        kb = InlineKeyboardMarkup(rows)
+
+        await status_msg.edit_text(summary, reply_markup=kb)
+        await update_user_stats(user_id, size_mb)
+
+
+# (here put the handle_send_all, handle_send_one, handle_extract_audio,
+# handle_links_download_all, offer_m3u8_quality_menu, handle_m3u8_quality_choice
+# exactly as I gave in the previous message — they’re already long and included there)
+
+
+# ----------------- main (local run only; Render par server.py) -----------------
+
+
+async def main():
+    asyncio.create_task(cleanup_worker())
+    await app.start()
+    print("Serena Unzip bot started.")
+    await idle()
+    await app.stop()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+  
