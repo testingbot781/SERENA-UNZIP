@@ -1209,6 +1209,7 @@ async def handle_send_all(client: Client, cq: CallbackQuery, task_id: str):
     )
 
     chat_id = cq.message.chat.id
+    reply_to = cq.message.id
     is_private = cq.message.chat.type == enums.ChatType.PRIVATE
     pinned = False
 
@@ -1242,6 +1243,7 @@ async def handle_send_all(client: Client, cq: CallbackQuery, task_id: str):
                 status = await client.send_message(
                     chat_id,
                     f"Uploading: {name}",
+                    reply_to_message_id=reply_to,
                 )
                 start_u = time.time()
                 sent = await client.send_video(
@@ -1251,6 +1253,7 @@ async def handle_send_all(client: Client, cq: CallbackQuery, task_id: str):
                     thumb=thumb_arg,
                     progress=progress_for_pyrogram,
                     progress_args=(status, start_u, name, "to Telegram"),
+                    reply_to_message_id=reply_to,
                 )
                 try:
                     await status.delete()
@@ -1260,6 +1263,7 @@ async def handle_send_all(client: Client, cq: CallbackQuery, task_id: str):
                 status = await client.send_message(
                     chat_id,
                     f"Uploading: {rel}",
+                    reply_to_message_id=reply_to,
                 )
                 start_u = time.time()
                 sent = await client.send_document(
@@ -1268,6 +1272,7 @@ async def handle_send_all(client: Client, cq: CallbackQuery, task_id: str):
                     caption=rel,
                     progress=progress_for_pyrogram,
                     progress_args=(status, start_u, rel, "to Telegram"),
+                    reply_to_message_id=reply_to,
                 )
                 try:
                     await status.delete()
@@ -1291,7 +1296,7 @@ async def handle_send_all(client: Client, cq: CallbackQuery, task_id: str):
         except Exception:
             pass
 
-    await client.send_message(chat_id, "All extracted files sent ✅")
+    await client.send_message(chat_id, "All extracted files sent ✅", reply_to_message_id=reply_to)
 
 
 async def handle_send_one(
@@ -1324,6 +1329,7 @@ async def handle_send_one(
         return
 
     chat_id = cq.message.chat.id
+    reply_to = cq.message.id
 
     try:
         sent = None
@@ -1341,6 +1347,7 @@ async def handle_send_one(
             status = await client.send_message(
                 chat_id,
                 f"Uploading: {name}",
+                reply_to_message_id=reply_to,
             )
             start_u = time.time()
             sent = await client.send_video(
@@ -1350,6 +1357,7 @@ async def handle_send_one(
                 thumb=thumb_arg,
                 progress=progress_for_pyrogram,
                 progress_args=(status, start_u, name, "to Telegram"),
+                reply_to_message_id=reply_to,
             )
             try:
                 await status.delete()
@@ -1359,6 +1367,7 @@ async def handle_send_one(
             status = await client.send_message(
                 chat_id,
                 f"Uploading: {rel}",
+                reply_to_message_id=reply_to,
             )
             start_u = time.time()
             sent = await client.send_document(
@@ -1367,6 +1376,7 @@ async def handle_send_one(
                 caption=rel,
                 progress=progress_for_pyrogram,
                 progress_args=(status, start_u, rel, "to Telegram"),
+                reply_to_message_id=reply_to,
             )
             try:
                 await status.delete()
@@ -1385,6 +1395,7 @@ async def handle_send_one(
                 pass
     except Exception:
         pass
+    
 
 
 # ----------------- extract audio from video -----------------
@@ -1424,6 +1435,7 @@ async def handle_extract_audio(client: Client, cq: CallbackQuery, msg: Message):
             user_id, str(temp_root), Config.AUTO_DELETE_DEFAULT_MIN
         )
 
+        reply_to = cq.message.id
         status = await cq.message.reply_text(
             "Downloading video for audio extract…"
         )
@@ -1461,6 +1473,7 @@ async def handle_extract_audio(client: Client, cq: CallbackQuery, msg: Message):
                 caption=f"Extracted audio from {file_name}",
                 progress=progress_for_pyrogram,
                 progress_args=(status, start_u, f"{base_name}.m4a", "to Telegram"),
+                reply_to_message_id=reply_to,
             )
             try:
                 await status.delete()
@@ -1474,6 +1487,7 @@ async def handle_extract_audio(client: Client, cq: CallbackQuery, msg: Message):
                 pass
         except Exception:
             pass
+    
 
 # ----------------- links: download_all (direct + GDrive + m3u8) -----------------
 
@@ -1542,6 +1556,7 @@ async def handle_links_download_all(
     ok = 0
     fail = 0
     chat_id = cq.message.chat.id
+    reply_to = cq.message.id
     is_private = cq.message.chat.type == enums.ChatType.PRIVATE
     pinned = False
 
@@ -1564,6 +1579,7 @@ async def handle_links_download_all(
             status = await client.send_message(
                 chat_id,
                 f"Downloading from link:\n{url}",
+                reply_to_message_id=reply_to,
             )
             final_path = await download_file(
                 url,
@@ -1592,6 +1608,7 @@ async def handle_links_download_all(
                     thumb=thumb_arg,
                     progress=progress_for_pyrogram,
                     progress_args=(status, start_u, basename, "to Telegram"),
+                    reply_to_message_id=reply_to,
                 )
             else:
                 start_u = time.time()
@@ -1601,6 +1618,7 @@ async def handle_links_download_all(
                     caption=basename,
                     progress=progress_for_pyrogram,
                     progress_args=(status, start_u, basename, "to Telegram"),
+                    reply_to_message_id=reply_to,
                 )
             try:
                 await status.delete()
@@ -1633,6 +1651,7 @@ async def handle_links_download_all(
             status = await client.send_message(
                 chat_id,
                 f"Downloading from GDrive:\n{url}",
+                reply_to_message_id=reply_to,
             )
             final_path = await download_file(
                 direct_url,
@@ -1661,6 +1680,7 @@ async def handle_links_download_all(
                     thumb=thumb_arg,
                     progress=progress_for_pyrogram,
                     progress_args=(status, start_u, basename, "to Telegram"),
+                    reply_to_message_id=reply_to,
                 )
             else:
                 start_u = time.time()
@@ -1670,6 +1690,7 @@ async def handle_links_download_all(
                     caption=basename,
                     progress=progress_for_pyrogram,
                     progress_args=(status, start_u, basename, "to Telegram"),
+                    reply_to_message_id=reply_to,
                 )
             try:
                 await status.delete()
@@ -1710,20 +1731,21 @@ async def handle_links_download_all(
             await client.unpin_chat_message(chat_id, cq.message.id)
         except Exception:
             pass
-        await client.send_message(chat_id, "All link downloads finished ✅")
-
+        await client.send_message(chat_id, "All link downloads finished ✅", reply_to_message_id=reply_to)
 
 async def offer_m3u8_quality_menu(
     client: Client, cq: CallbackQuery, user_id: int, url: str, temp_root: Path
 ):
     chat_id = cq.message.chat.id
+    reply_to = cq.message.id
 
     try:
         variants = await get_m3u8_variants(url)
     except Exception as e:
         await client.send_message(
             chat_id,
-            f"m3u8 parse nahi ho paya:\n<code>{e}</code>"
+            f"m3u8 parse nahi ho paya:\n<code>{e}</code>",
+            reply_to_message_id=reply_to,
         )
         return
 
@@ -1755,6 +1777,7 @@ async def offer_m3u8_quality_menu(
         chat_id,
         f"m3u8 stream mila:\n<code>{url}</code>\n\nQuality choose karo:",
         reply_markup=kb,
+        reply_to_message_id=reply_to,
     )
 
 
@@ -1784,6 +1807,7 @@ async def handle_m3u8_quality_choice(
     chat_id = cq.message.chat.id
     user = cq.from_user
     user_id = user.id
+    reply_to = cq.message.id
 
     await cq.answer()
     await cq.message.edit_text(f"Downloading {name} stream…")
@@ -1814,6 +1838,7 @@ async def handle_m3u8_quality_choice(
         thumb=thumb_arg,
         progress=progress_for_pyrogram,
         progress_args=(cq.message, start_u, base_caption, "to Telegram"),
+        reply_to_message_id=reply_to,
     )
     try:
         await cq.message.delete()
@@ -1826,8 +1851,6 @@ async def handle_m3u8_quality_choice(
     except Exception:
         pass
     M3U8_TASKS.pop(task_id, None)
-
-
 # ----------------- main (local run only; Render par server.py) -----------------
 
 
