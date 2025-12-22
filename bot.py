@@ -1248,6 +1248,7 @@ async def handle_send_all(client: Client, cq: CallbackQuery, task_id: str):
     )
 
     chat_id = cq.message.chat.id
+    thread_id = getattr(cq.message, "message_thread_id", None)
     is_private = cq.message.chat.type == enums.ChatType.PRIVATE
     pinned = False
 
@@ -1259,6 +1260,9 @@ async def handle_send_all(client: Client, cq: CallbackQuery, task_id: str):
             pinned = False
 
     for rel in files:
+        if user_cancelled.get(user.id):
+            break
+
         full = base_dir / rel
         if not full.is_file():
             continue
@@ -1275,7 +1279,11 @@ async def handle_send_all(client: Client, cq: CallbackQuery, task_id: str):
                 except Exception:
                     thumb_arg = None
 
-                status = await client.send_message(chat_id, f"Uploading: {name}")
+                status = await client.send_message(
+                    chat_id,
+                    f"Uploading: {name}",
+                    message_thread_id=thread_id,
+                )
                 start_u = time.time()
                 sent = await client.send_video(
                     chat_id,
@@ -1284,13 +1292,18 @@ async def handle_send_all(client: Client, cq: CallbackQuery, task_id: str):
                     thumb=thumb_arg,
                     progress=progress_for_pyrogram,
                     progress_args=(status, start_u, name, "to Telegram"),
+                    message_thread_id=thread_id,
                 )
                 try:
                     await status.delete()
                 except Exception:
                     pass
             else:
-                status = await client.send_message(chat_id, f"Uploading: {rel}")
+                status = await client.send_message(
+                    chat_id,
+                    f"Uploading: {rel}",
+                    message_thread_id=thread_id,
+                )
                 start_u = time.time()
                 sent = await client.send_document(
                     chat_id=chat_id,
@@ -1298,6 +1311,7 @@ async def handle_send_all(client: Client, cq: CallbackQuery, task_id: str):
                     caption=rel,
                     progress=progress_for_pyrogram,
                     progress_args=(status, start_u, rel, "to Telegram"),
+                    message_thread_id=thread_id,
                 )
                 try:
                     await status.delete()
@@ -1321,7 +1335,7 @@ async def handle_send_all(client: Client, cq: CallbackQuery, task_id: str):
         except Exception:
             pass
 
-    await client.send_message(chat_id, "All extracted files sent ✅")
+    await client.send_message(chat_id, "All extracted files sent ✅", message_thread_id=thread_id)
 
 
 async def handle_send_one(
