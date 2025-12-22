@@ -1368,6 +1368,8 @@ async def handle_send_one(
         return
 
     chat_id = cq.message.chat.id
+    thread_id = getattr(cq.message, "message_thread_id", None)
+
     try:
         sent = None
         if is_video_path(rel):
@@ -1381,7 +1383,11 @@ async def handle_send_one(
             except Exception:
                 thumb_arg = None
 
-            status = await client.send_message(chat_id, f"Uploading: {name}")
+            status = await client.send_message(
+                chat_id,
+                f"Uploading: {name}",
+                message_thread_id=thread_id,
+            )
             start_u = time.time()
             sent = await client.send_video(
                 chat_id,
@@ -1390,13 +1396,18 @@ async def handle_send_one(
                 thumb=thumb_arg,
                 progress=progress_for_pyrogram,
                 progress_args=(status, start_u, name, "to Telegram"),
+                message_thread_id=thread_id,
             )
             try:
                 await status.delete()
             except Exception:
                 pass
         else:
-            status = await client.send_message(chat_id, f"Uploading: {rel}")
+            status = await client.send_message(
+                chat_id,
+                f"Uploading: {rel}",
+                message_thread_id=thread_id,
+            )
             start_u = time.time()
             sent = await client.send_document(
                 chat_id=chat_id,
@@ -1404,6 +1415,7 @@ async def handle_send_one(
                 caption=rel,
                 progress=progress_for_pyrogram,
                 progress_args=(status, start_u, rel, "to Telegram"),
+                message_thread_id=thread_id,
             )
             try:
                 await status.delete()
@@ -1413,7 +1425,10 @@ async def handle_send_one(
         if sent:
             try:
                 await log_user_output(
-                    client, user, sent, f"unzip send_one from {info.get('archive_name','archive')}"
+                    client,
+                    user,
+                    sent,
+                    f"unzip send_one from {info.get('archive_name','archive')}",
                 )
             except Exception:
                 pass
