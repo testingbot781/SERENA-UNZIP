@@ -47,6 +47,7 @@ Push this repo to GitHub.
 Create Web Service on Render.
 Build command: pip install -r requirements.txt
 Start command: python bot.py
+if You Are Deploying On Render then start Command Will Be : uvicorn server:fastapi_app --host 0.0.0.0 --port $PORT
 Add environment variables (API_ID, API_HASH, BOT_TOKEN, MONGO_URI, etc.).
 Make sure ffmpeg, unrar, 7z tools available in your environment (custom image or build steps).
 
